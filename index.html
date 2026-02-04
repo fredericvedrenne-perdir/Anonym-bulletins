@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anonymiseur Avancé (Cycles & Multi-pages)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; padding: 20px; text-align: center; }
+        .container { max-width: 1000px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        h1 { margin-top: 0; color: #333; }
+        
+        /* Contrôles */
+        .controls-wrapper { background: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+        .control-row { display: flex; gap: 15px; justify-content: center; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+        
+        button { padding: 8px 15px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; color: white; background-color: #007bff; }
+        button:disabled { background-color: #ccc !important; cursor: not-allowed; }
+        button.secondary { background-color: #6c757d; }
+        #btn-process { background-color: #28a745; font-size: 1.1em; padding: 10px 20px; }
+        #btn-clear { background-color: #dc3545; }
+        
+        select, input[type="number"] { padding: 8px; border-radius: 4px; border: 1px solid #ccc; }
+
+        /* Zone d'édition */
+        #editor-wrapper {
+            position: relative;
+            display: inline-block;
+            border: 1px solid #999;
+            box-shadow: 0 0 10px rgba(0,0,0,0.2);
+            user-select: none; 
+            -webkit-user-select: none;
+        }
+
+        canvas { display: block; max-width: 100%; }
+
+        #temp-selection {
+            position: absolute;
+            border: 2px dashed blue;
+            background-color: rgba(0, 0, 255, 0.1);
+            pointer-events: none;
+            display: none;
+        }
+
+        .saved-zone {
+            position: absolute;
+            border: 2px solid red;
+            background-color: rgba(255, 0, 0, 0.3);
+            cursor: pointer;
+            display: flex; /* Pour centrer le X si besoin */
+            align-items: center;
+            justify-content: center;
+        }
+        .saved-zone:hover {
+            background-color: rgba(255, 0, 0, 0.5);
+        }
+        
+        .nav-indicator { font-weight: bold; font-size: 1.1em; color: #333; margin: 0 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Anonymiseur Avancé (V7)</h1>
+    <p>Gère les PDF protégés, évite les pages blanches et gère les bulletins de plusieurs pages.</p>
+    
+    <div class="controls-wrapper">
+        <div class="control-row">
+            <input type="file" id="fileInput" accept="application/pdf" />
+        </div>
+
+        <div class="control-row" id="pattern-controls" style="display:none; border-top: 1px solid #ccc; padding-top:10px;">
+            <label>Combien de pages par élève/bulletin ?</label>
+            <input type="number" id="patternLength" value="1" min="1" max="10" style="width: 50px;">
+            <button class="secondary" id="btn-update-pattern">Appliquer</button>
+        </div>
+
+        <div class="control-row" id="nav-controls" style="display:none;">
+            <button id="prevPage" class="secondary">&lt; Précédent</button>
+            <span id="pageIndicator" class="nav-indicator">Configuration de la page 1 / 1</span>
+            <button id="nextPage" class="secondary">Suivant &gt;</button>
+        </div>
+
+        <div class="control-row">
+            <button id="btn-clear" style="display:none;">Effacer la page actuelle</button>
+            <button id="btn-process" disabled>Anonymiser et Télécharger</button>
+        </div>
+    </div>
+
+    <div id="editor-wrapper">
+        <canvas id="pdf-render"></canvas>
+        <div id="temp-selection"></div>
+        <div id="zones-container"></div>
+    </div>
+</div>
+
+<script>
+    const { PDFDocument, rgb } = PDFLib;
+
+    let originalPdfBytes = null; 
+    let displayBuffer = null;
+    let pdfDocProxy = null; // Objet PDF.js chargé
+
+    // --- GESTION DU MOTIF (PATTERN) ---
+    let patternLength = 1;      // Nombre de pages par bulletin (ex: 2 pour recto/verso)
+    let currentPatternIndex = 0; // Page actuelle du cycle (0 pour la 1ère, 1 pour la 2ème...)
+    
+    // Structure de données complexe : Tableau de tableaux
+    // patternZones[0] = liste des zones pour la page 1 du motif
+    // patternZones[1] = liste des zones pour la page 2 du motif
+    let patternZones = [ [] ]; 
+
+    let isDrawing = false;
+    let startX = 0; 
+    let startY = 0;
+    
+    // UI Elements
+    const fileInput = document.getElementById('fileInput');
+    const canvas = document.getElementById('pdf-render');
+    const ctx = canvas.getContext('2d');
+    const tempSelection = document.getElementById('temp-selection');
+    const zonesContainer = document.getElementById('zones-container');
+    const editorWrapper = document.getElementById('editor-wrapper');
+    const btnProcess = document.getElementById('btn-process');
+    const btnClear = document.getElementById('btn-clear');
+    
+    const divPattern = document.getElementById('pattern-controls');
+    const inputPattern = document.getElementById('patternLength');
+    const btnUpdatePattern = document.getElementById('btn-update-pattern');
+    
+    const divNav = document.getElementById('nav-controls');
+    const btnPrev = document.getElementById('prevPage');
+    const btnNext = document.getElementById('nextPage');
+    const txtIndicator = document.getElementById('pageIndicator');
+
+    // --- 1. CHARGEMENT INITIAL ---
+    fileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        try {
+            const arrayBuffer = await file.arrayBuffer();
+            originalPdfBytes = arrayBuffer.slice(0); 
+            displayBuffer = arrayBuffer.slice(0);
+
+            // Charger PDF.js une seule fois
+            const loadingTask = pdfjsLib.getDocument(displayBuffer);
+            pdfDocProxy = await loadingTask.promise;
+
+            // Reset complet
+            patternLength = 1;
+            inputPattern.value = 1;
+            currentPatternIndex = 0;
+            patternZones = [ [] ]; // Reset zones
+            
+            // Afficher l'UI
+            divPattern.style.display = 'flex';
+            divNav.style.display = 'none'; // Pas besoin si 1 page
+            btnProcess.disabled = true;
+
+            await renderCurrentPatternPage();
+
+        } catch (err) {
+            alert("Erreur lors du chargement : " + err.message);
+            console.error(err);
+        }
+    });
+
+    // --- 2. GESTION DU MOTIF ET NAVIGATION ---
+    
+    btnUpdatePattern.addEventListener('click', () => {
+        const val = parseInt(inputPattern.value);
+        if(val < 1) return;
+        
+        patternLength = val;
+        
+        // Redimensionner le tableau des zones
+        // Si on augmente, on ajoute des tableaux vides.
+        // Si on réduit, on perd les données des pages supprimées (logique).
+        while(patternZones.length < patternLength) {
+            patternZones.push([]);
+        }
+        // (Optionnel : on pourrait couper si patternZones.length > patternLength, mais pas grave)
+
+        // Gestion affichage nav
+        if(patternLength > 1) {
+            divNav.style.display = 'flex';
+        } else {
+            divNav.style.display = 'none';
+        }
+        
+        // Revenir à la page 1 du cycle
+        currentPatternIndex = 0;
+        renderCurrentPatternPage();
+    });
+
+    btnPrev.addEventListener('click', () => {
+        if(currentPatternIndex > 0) {
+            currentPatternIndex--;
+            renderCurrentPatternPage();
+        }
+    });
+
+    btnNext.addEventListener('click', () => {
+        if(currentPatternIndex < patternLength - 1) {
+            currentPatternIndex++;
+            renderCurrentPatternPage();
+        }
+    });
+
+    // --- 3. AFFICHAGE INTELLIGENT ---
+    async function renderCurrentPatternPage() {
+        if(!pdfDocProxy) return;
+
+        // Met à jour le texte
+        txtIndicator.textContent = `Configuration de la page ${currentPatternIndex + 1} / ${patternLength}`;
+        
+        // Gérer l'état des boutons Prev/Next
+        btnPrev.disabled = (currentPatternIndex === 0);
+        btnNext.disabled = (currentPatternIndex === patternLength - 1);
+
+        // QUELLE PAGE DU PDF AFFICHER ?
+        // Pour aider l'utilisateur, si on configure la page 2 du motif,
+        // on essaie d'afficher la VRAIE page 2 du PDF (index 1 + 1).
+        // Si le PDF n'a qu'une page mais qu'on veut un motif de 3, on reste sur la dernière dispo.
+        let pdfPageNumber = currentPatternIndex + 1;
+        if (pdfPageNumber > pdfDocProxy.numPages) {
+            pdfPageNumber = 1; // Fallback si le PDF est trop court pour le motif (cas rare)
+        }
+
+        const page = await pdfDocProxy.getPage(pdfPageNumber);
+        const viewport = page.getViewport({ scale: 1.5 });
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const renderContext = { canvasContext: ctx, viewport: viewport };
+        await page.render(renderContext).promise;
+
+        // Une fois le canvas dessiné, on réaffiche les zones rouges DE CETTE ETAPE
+        redrawZonesOverlay();
+    }
+
+    function redrawZonesOverlay() {
+        zonesContainer.innerHTML = '';
+        const currentZones = patternZones[currentPatternIndex] || [];
+        
+        currentZones.forEach((zone, idx) => {
+            const div = document.createElement('div');
+            div.className = 'saved-zone';
+            div.style.left = (zone.x / canvas.width * 100) + '%';
+            div.style.top = (zone.y / canvas.height * 100) + '%';
+            div.style.width = (zone.w / canvas.width * 100) + '%';
+            div.style.height = (zone.h / canvas.height * 100) + '%';
+            div.title = "Cliquez pour supprimer";
+            div.onclick = () => removeZone(idx);
+            zonesContainer.appendChild(div);
+        });
+
+        updateProcessButtonState();
+        
+        if(currentZones.length > 0) {
+            btnClear.style.display = 'inline-block';
+            btnClear.textContent = `Effacer page ${currentPatternIndex + 1}`;
+        } else {
+            btnClear.style.display = 'none';
+        }
+    }
+
+    function removeZone(index) {
+        patternZones[currentPatternIndex].splice(index, 1);
+        redrawZonesOverlay();
+    }
+
+    function updateProcessButtonState() {
+        // Active le bouton si AU MOINS UNE zone est définie quelque part dans le motif
+        const hasZones = patternZones.some(arr => arr.length > 0);
+        btnProcess.disabled = !hasZones;
+    }
+
+    // --- 4. DESSIN (Similaire avant, mais pousse dans patternZones[currentPatternIndex]) ---
+    function getMousePos(evt) {
+        const rect = canvas.getBoundingClientRect(); 
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        return {
+            x: (evt.clientX - rect.left) * scaleX,
+            y: (evt.clientY - rect.top) * scaleY
+        };
+    }
+
+    editorWrapper.addEventListener('mousedown', (e) => {
+        if (!originalPdfBytes) return;
+        const pos = getMousePos(e);
+        startX = pos.x;
+        startY = pos.y;
+        isDrawing = true;
+
+        tempSelection.style.display = 'block';
+        tempSelection.style.left = (startX / canvas.width * 100) + '%'; 
+        tempSelection.style.top = (startY / canvas.height * 100) + '%';
+        tempSelection.style.width = '0%';
+        tempSelection.style.height = '0%';
+    });
+
+    editorWrapper.addEventListener('mousemove', (e) => {
+        if (!isDrawing) return;
+        const pos = getMousePos(e);
+        const currentX = pos.x;
+        const currentY = pos.y;
+        const width = currentX - startX;
+        const height = currentY - startY;
+
+        const cssLeft = (width < 0 ? currentX : startX) / canvas.width * 100;
+        const cssTop = (height < 0 ? currentY : startY) / canvas.height * 100;
+        const cssWidth = Math.abs(width) / canvas.width * 100;
+        const cssHeight = Math.abs(height) / canvas.height * 100;
+
+        tempSelection.style.left = cssLeft + '%';
+        tempSelection.style.top = cssTop + '%';
+        tempSelection.style.width = cssWidth + '%';
+        tempSelection.style.height = cssHeight + '%';
+    });
+
+    editorWrapper.addEventListener('mouseup', (e) => {
+        if (!isDrawing) return;
+        isDrawing = false;
+        tempSelection.style.display = 'none';
+        const pos = getMousePos(e);
+        const w = pos.x - startX;
+        const h = pos.y - startY;
+
+        if (Math.abs(w) < 5 || Math.abs(h) < 5) return;
+
+        const rect = {
+            x: w < 0 ? pos.x : startX,
+            y: h < 0 ? pos.y : startY,
+            w: Math.abs(w),
+            h: Math.abs(h)
+        };
+
+        // AJOUT DANS LE TABLEAU DE LA PAGE COURANTE
+        if(!patternZones[currentPatternIndex]) patternZones[currentPatternIndex] = [];
+        patternZones[currentPatternIndex].push(rect);
+        
+        redrawZonesOverlay();
+    });
+
+    btnClear.addEventListener('click', () => {
+        patternZones[currentPatternIndex] = [];
+        redrawZonesOverlay();
+    });
+
+
+    // --- 5. TRAITEMENT FINAL (CYCLE + EMBEDDING) ---
+    btnProcess.addEventListener('click', async () => {
+        if (!originalPdfBytes) return;
+        
+        const oldText = btnProcess.textContent;
+        btnProcess.textContent = "Traitement des pages...";
+        btnProcess.disabled = true;
+
+        try {
+            const sourcePdfDoc = await PDFDocument.load(originalPdfBytes, { ignoreEncryption: true });
+            const newPdfDoc = await PDFDocument.create();
+
+            // Embed pages (Photocopieuse)
+            const embeddedPages = await newPdfDoc.embedPdf(sourcePdfDoc, sourcePdfDoc.getPageIndices());
+
+            // BOUCLE SUR TOUTES LES PAGES DU PDF ORIGINAL
+            embeddedPages.forEach((embeddedPage, globalPageIndex) => {
+                const { width, height } = embeddedPage;
+                const newPage = newPdfDoc.addPage([width, height]);
+                
+                newPage.drawPage(embeddedPage, { x: 0, y: 0, width: width, height: height });
+
+                // --- LOGIQUE DU CYCLE (MODULO) ---
+                // Si globalPageIndex = 0 (Page 1) -> on utilise patternZones[0]
+                // Si globalPageIndex = 1 (Page 2) -> on utilise patternZones[1]
+                // Si globalPageIndex = 2 (Page 3) -> on retourne à patternZones[0] (si patternLength est 2)
+                const patternIndexToUse = globalPageIndex % patternLength;
+                const zonesToApply = patternZones[patternIndexToUse] || [];
+
+                zonesToApply.forEach((zone) => {
+                    const xRatio = zone.x / canvas.width;
+                    const yRatio = zone.y / canvas.height;
+                    const wRatio = zone.w / canvas.width;
+                    const hRatio = zone.h / canvas.height;
+
+                    const pdfX = xRatio * width;
+                    const pdfW = wRatio * width;
+                    const pdfH = hRatio * height;
+                    const pdfY = height - (yRatio * height) - pdfH;
+
+                    newPage.drawRectangle({
+                        x: pdfX,
+                        y: pdfY,
+                        width: pdfW,
+                        height: pdfH,
+                        color: rgb(0, 0, 0),
+                    });
+                });
+            });
+
+            const pdfBytes = await newPdfDoc.save();
+            const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = 'bulletins_anonymes_v7.pdf';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+
+        } catch (error) {
+            console.error(error);
+            alert("Erreur technique : " + error.message);
+        } finally {
+            btnProcess.textContent = oldText;
+            btnProcess.disabled = false;
+        }
+    });
+</script>
+
+</body>
+</html>
